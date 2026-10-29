@@ -1,0 +1,1 @@
+cl /nologo /EHsc /LD d3d9proxy.cpp d3d9.def /link /OUT:d3d9.dll
