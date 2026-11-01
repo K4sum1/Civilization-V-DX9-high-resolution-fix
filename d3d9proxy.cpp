@@ -18,7 +18,11 @@ using CreateDepthFn = HRESULT (WINAPI*)(
     D3DMULTISAMPLE_TYPE, DWORD, BOOL,
     IDirect3DSurface9**, HANDLE*);
 
+using PerfBeginEventFn = int (WINAPI*)(D3DCOLOR, LPCWSTR);
+using PerfEndEventFn = int (WINAPI*)();
+
 static HMODULE gSystemD3D9 = nullptr;
+static INIT_ONCE gLoadSystemD3D9Once = INIT_ONCE_STATIC_INIT;
 
 static std::atomic<UINT> gBackBufferWidth{ 0 };
 static std::atomic<UINT> gBackBufferHeight{ 0 };
@@ -37,6 +41,32 @@ static void Log(const char* text, UINT a = 0, UINT b = 0,
         fprintf(f, text, a, b, c, d);
         fclose(f);
     }
+}
+
+static BOOL CALLBACK LoadSystemD3D9Once(
+    PINIT_ONCE, PVOID, PVOID*)
+{
+    wchar_t path[MAX_PATH] = {};
+    const UINT n = GetSystemDirectoryW(path, MAX_PATH);
+
+    if (!n || n >= MAX_PATH - 12)
+        return TRUE;
+
+    wcscat_s(path, L"\\d3d9.dll");
+    gSystemD3D9 = LoadLibraryW(path);
+
+    return TRUE;
+}
+
+static HMODULE GetSystemD3D9()
+{
+    InitOnceExecuteOnce(
+        &gLoadSystemD3D9Once,
+        LoadSystemD3D9Once,
+        nullptr,
+        nullptr);
+
+    return gSystemD3D9;
 }
 
 static bool PatchSlot(void* object, int index, void* replacement,
@@ -151,8 +181,8 @@ static HRESULT WINAPI HookCreateDepth(
                 return hr;
             }
 
-            // If the rounded-up allocation fails, try the exact dimensions
-            // needed for the backbuffer before falling back to the original.
+            // If the rounded-up allocation fails, try the exact required
+            // dimensions before falling back to the original size.
             if (requiredWidth != roundedWidth ||
                 requiredHeight != roundedHeight) {
                 Log("Rounded allocation failed (0x%08X); "
@@ -213,22 +243,12 @@ static HRESULT WINAPI HookCreateDevice(
 
 extern "C" IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT sdkVersion)
 {
-    if (!gSystemD3D9) {
-        wchar_t path[MAX_PATH] = {};
-        UINT n = GetSystemDirectoryW(path, MAX_PATH);
-
-        if (!n || n >= MAX_PATH - 12)
-            return nullptr;
-
-        wcscat_s(path, L"\\d3d9.dll");
-
-        gSystemD3D9 = LoadLibraryW(path);
-        if (!gSystemD3D9)
-            return nullptr;
-    }
+    HMODULE systemD3D9 = GetSystemD3D9();
+    if (!systemD3D9)
+        return nullptr;
 
     auto realCreate9 = reinterpret_cast<Create9Fn>(
-        GetProcAddress(gSystemD3D9, "Direct3DCreate9"));
+        GetProcAddress(systemD3D9, "Direct3DCreate9"));
 
     if (!realCreate9)
         return nullptr;
@@ -242,4 +262,29 @@ extern "C" IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT sdkVersion)
     }
 
     return d3d;
+}
+
+extern "C" int WINAPI Proxy_D3DPERF_BeginEvent(
+    D3DCOLOR color, LPCWSTR name)
+{
+    HMODULE systemD3D9 = GetSystemD3D9();
+    if (!systemD3D9)
+        return -1;
+
+    auto realFunction = reinterpret_cast<PerfBeginEventFn>(
+        GetProcAddress(systemD3D9, "D3DPERF_BeginEvent"));
+
+    return realFunction ? realFunction(color, name) : -1;
+}
+
+extern "C" int WINAPI Proxy_D3DPERF_EndEvent()
+{
+    HMODULE systemD3D9 = GetSystemD3D9();
+    if (!systemD3D9)
+        return -1;
+
+    auto realFunction = reinterpret_cast<PerfEndEventFn>(
+        GetProcAddress(systemD3D9, "D3DPERF_EndEvent"));
+
+    return realFunction ? realFunction() : -1;
 }
