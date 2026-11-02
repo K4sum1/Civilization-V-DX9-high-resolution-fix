@@ -6,8 +6,11 @@
 #include <atomic>
 #include <cstdio>
 #include <limits>
+#include <mutex>
+#include <cstdarg>
 
 using Create9Fn = IDirect3D9* (WINAPI*)(UINT);
+using Create9ExFn = HRESULT (WINAPI*)(UINT, IDirect3D9Ex**);
 using CreateDeviceFn = HRESULT (WINAPI*)(
     IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD,
     D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
@@ -20,9 +23,14 @@ using CreateDepthFn = HRESULT (WINAPI*)(
 
 using PerfBeginEventFn = int (WINAPI*)(D3DCOLOR, LPCWSTR);
 using PerfEndEventFn = int (WINAPI*)();
+using PerfSetMarkerFn = void (WINAPI*)(D3DCOLOR, LPCWSTR);
+using PerfSetRegionFn = void (WINAPI*)(D3DCOLOR, LPCWSTR);
+using PerfSetOptionsFn = void (WINAPI*)(DWORD);
+using PerfGetStatusFn = DWORD (WINAPI*)();
+using PerfQueryRepeatFrameFn = BOOL (WINAPI*)();
 
 static HMODULE gSystemD3D9 = nullptr;
-static INIT_ONCE gLoadSystemD3D9Once = INIT_ONCE_STATIC_INIT;
+static std::once_flag gLoadOnce;
 
 static std::atomic<UINT> gBackBufferWidth{ 0 };
 static std::atomic<UINT> gBackBufferHeight{ 0 };
@@ -31,46 +39,43 @@ static CreateDeviceFn gRealCreateDevice = nullptr;
 static ResetFn gRealReset = nullptr;
 static CreateDepthFn gRealCreateDepth = nullptr;
 
-static void Log(const char* text, UINT a = 0, UINT b = 0,
-                UINT c = 0, UINT d = 0)
+static void Log(const char* fmt, ...)
 {
+#ifdef _DEBUG
     FILE* f = nullptr;
     fopen_s(&f, "Civ5DepthFix.log", "a");
+    if (!f)
+        return;
 
-    if (f) {
-        fprintf(f, text, a, b, c, d);
-        fclose(f);
-    }
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(f, fmt, args);
+    va_end(args);
+
+    fclose(f);
+#else
+    (void)fmt;
+#endif
 }
 
-static BOOL CALLBACK LoadSystemD3D9Once(
-    PINIT_ONCE, PVOID, PVOID*)
+static void LoadSystemD3D9()
 {
     wchar_t path[MAX_PATH] = {};
     const UINT n = GetSystemDirectoryW(path, MAX_PATH);
-
     if (!n || n >= MAX_PATH - 12)
-        return TRUE;
+        return;
 
     wcscat_s(path, L"\\d3d9.dll");
     gSystemD3D9 = LoadLibraryW(path);
-
-    return TRUE;
 }
 
 static HMODULE GetSystemD3D9()
 {
-    InitOnceExecuteOnce(
-        &gLoadSystemD3D9Once,
-        LoadSystemD3D9Once,
-        nullptr,
-        nullptr);
-
+    std::call_once(gLoadOnce, LoadSystemD3D9);
     return gSystemD3D9;
 }
 
-static bool PatchSlot(void* object, int index, void* replacement,
-                      void** original)
+static bool PatchSlot(void* object, int index, void* replacement, void** original)
 {
     if (!object)
         return false;
@@ -94,26 +99,27 @@ static bool PatchSlot(void* object, int index, void* replacement,
     return true;
 }
 
+static void RememberBackBufferSize(UINT w, UINT h)
+{
+    gBackBufferWidth.store(w, std::memory_order_relaxed);
+    gBackBufferHeight.store(h, std::memory_order_relaxed);
+}
+
 static void RememberBackBuffer(IDirect3DDevice9* device)
 {
-    gBackBufferWidth.store(0, std::memory_order_relaxed);
-    gBackBufferHeight.store(0, std::memory_order_relaxed);
-
-    if (!device)
+    if (!device) {
+        RememberBackBufferSize(0, 0);
         return;
+    }
 
     IDirect3DSurface9* surface = nullptr;
 
     if (SUCCEEDED(device->GetBackBuffer(
-            0, 0, D3DBACKBUFFER_TYPE_MONO, &surface)) &&
-        surface)
+            0, 0, D3DBACKBUFFER_TYPE_MONO, &surface)) && surface)
     {
         D3DSURFACE_DESC desc{};
-
-        if (SUCCEEDED(surface->GetDesc(&desc))) {
-            gBackBufferWidth.store(desc.Width, std::memory_order_relaxed);
-            gBackBufferHeight.store(desc.Height, std::memory_order_relaxed);
-        }
+        if (SUCCEEDED(surface->GetDesc(&desc)))
+            RememberBackBufferSize(desc.Width, desc.Height);
 
         surface->Release();
     }
@@ -134,6 +140,10 @@ static UINT RoundUp2048(UINT value)
 static HRESULT WINAPI HookReset(
     IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* pp)
 {
+    if (pp) {
+        RememberBackBufferSize(pp->BackBufferWidth, pp->BackBufferHeight);
+    }
+
     if (!gRealReset)
         return D3DERR_INVALIDCALL;
 
@@ -154,12 +164,10 @@ static HRESULT WINAPI HookCreateDepth(
     if (!gRealCreateDepth)
         return D3DERR_INVALIDCALL;
 
-    // Adjust only the 2048x2048 surface identified in the trace.
+    // Only special-case the known problematic 2048x2048 depth surface.
     if (width == 2048 && height == 2048) {
-        const UINT bbWidth =
-            gBackBufferWidth.load(std::memory_order_relaxed);
-        const UINT bbHeight =
-            gBackBufferHeight.load(std::memory_order_relaxed);
+        const UINT bbWidth = gBackBufferWidth.load(std::memory_order_relaxed);
+        const UINT bbHeight = gBackBufferHeight.load(std::memory_order_relaxed);
 
         const UINT requiredWidth = (std::max)(width, bbWidth);
         const UINT requiredHeight = (std::max)(height, bbHeight);
@@ -168,46 +176,30 @@ static HRESULT WINAPI HookCreateDepth(
         const UINT roundedHeight = RoundUp2048(requiredHeight);
 
         if (roundedWidth > width || roundedHeight > height) {
-            Log("Trying depth surface %ux%u -> %ux%u\n",
+            Log("Depth surface %ux%u -> %ux%u\n",
                 width, height, roundedWidth, roundedHeight);
 
             HRESULT hr = gRealCreateDepth(
                 device, roundedWidth, roundedHeight, format,
                 multisample, quality, discard, surface, sharedHandle);
 
-            if (SUCCEEDED(hr)) {
-                Log("Larger depth surface created: %ux%u\n",
-                    roundedWidth, roundedHeight);
+            if (SUCCEEDED(hr))
                 return hr;
-            }
 
-            // If the rounded-up allocation fails, try the exact required
-            // dimensions before falling back to the original size.
-            if (requiredWidth != roundedWidth ||
-                requiredHeight != roundedHeight) {
-                Log("Rounded allocation failed (0x%08X); "
-                    "trying exact %ux%u\n",
-                    static_cast<UINT>(hr),
-                    requiredWidth, requiredHeight);
+            Log("Rounded allocation failed: 0x%08X\n", static_cast<UINT>(hr));
 
+            if (requiredWidth != roundedWidth || requiredHeight != roundedHeight) {
                 hr = gRealCreateDepth(
                     device, requiredWidth, requiredHeight, format,
                     multisample, quality, discard, surface, sharedHandle);
 
-                if (SUCCEEDED(hr)) {
-                    Log("Exact depth surface created: %ux%u\n",
-                        requiredWidth, requiredHeight);
+                if (SUCCEEDED(hr))
                     return hr;
-                }
 
-                Log("Exact allocation failed (0x%08X)\n",
-                    static_cast<UINT>(hr));
-            } else {
-                Log("Rounded allocation failed (0x%08X)\n",
-                    static_cast<UINT>(hr));
+                Log("Exact allocation failed: 0x%08X\n", static_cast<UINT>(hr));
             }
 
-            Log("Retrying original depth surface size\n");
+            Log("Falling back to original depth size\n");
         }
     }
 
@@ -221,6 +213,10 @@ static HRESULT WINAPI HookCreateDevice(
     DWORD behavior, D3DPRESENT_PARAMETERS* pp,
     IDirect3DDevice9** device)
 {
+    if (pp) {
+        RememberBackBufferSize(pp->BackBufferWidth, pp->BackBufferHeight);
+    }
+
     if (!gRealCreateDevice)
         return D3DERR_INVALIDCALL;
 
@@ -230,8 +226,9 @@ static HRESULT WINAPI HookCreateDevice(
     if (SUCCEEDED(hr) && device && *device) {
         RememberBackBuffer(*device);
 
-        // IDirect3DDevice9 vtable slots: Reset=16,
-        // CreateDepthStencilSurface=29.
+        // IDirect3DDevice9 vtable:
+        // Reset = 16
+        // CreateDepthStencilSurface = 29
         PatchSlot(*device, 16, reinterpret_cast<void*>(HookReset),
                   reinterpret_cast<void**>(&gRealReset));
         PatchSlot(*device, 29, reinterpret_cast<void*>(HookCreateDepth),
@@ -256,7 +253,7 @@ extern "C" IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT sdkVersion)
     IDirect3D9* d3d = realCreate9(sdkVersion);
 
     if (d3d) {
-        // IDirect3D9::CreateDevice is vtable slot 16.
+        // IDirect3D9::CreateDevice = vtable slot 16
         PatchSlot(d3d, 16, reinterpret_cast<void*>(HookCreateDevice),
                   reinterpret_cast<void**>(&gRealCreateDevice));
     }
@@ -264,17 +261,37 @@ extern "C" IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT sdkVersion)
     return d3d;
 }
 
-extern "C" int WINAPI Proxy_D3DPERF_BeginEvent(
-    D3DCOLOR color, LPCWSTR name)
+extern "C" HRESULT WINAPI Proxy_Direct3DCreate9Ex(
+    UINT sdkVersion, IDirect3D9Ex** out)
+{
+    if (!out)
+        return D3DERR_INVALIDCALL;
+
+    *out = nullptr;
+
+    HMODULE systemD3D9 = GetSystemD3D9();
+    if (!systemD3D9)
+        return D3DERR_NOTAVAILABLE;
+
+    auto realCreate9Ex = reinterpret_cast<Create9ExFn>(
+        GetProcAddress(systemD3D9, "Direct3DCreate9Ex"));
+
+    if (!realCreate9Ex)
+        return D3DERR_NOTAVAILABLE;
+
+    return realCreate9Ex(sdkVersion, out);
+}
+
+extern "C" int WINAPI Proxy_D3DPERF_BeginEvent(D3DCOLOR color, LPCWSTR name)
 {
     HMODULE systemD3D9 = GetSystemD3D9();
     if (!systemD3D9)
         return -1;
 
-    auto realFunction = reinterpret_cast<PerfBeginEventFn>(
+    auto fn = reinterpret_cast<PerfBeginEventFn>(
         GetProcAddress(systemD3D9, "D3DPERF_BeginEvent"));
 
-    return realFunction ? realFunction(color, name) : -1;
+    return fn ? fn(color, name) : -1;
 }
 
 extern "C" int WINAPI Proxy_D3DPERF_EndEvent()
@@ -283,8 +300,68 @@ extern "C" int WINAPI Proxy_D3DPERF_EndEvent()
     if (!systemD3D9)
         return -1;
 
-    auto realFunction = reinterpret_cast<PerfEndEventFn>(
+    auto fn = reinterpret_cast<PerfEndEventFn>(
         GetProcAddress(systemD3D9, "D3DPERF_EndEvent"));
 
-    return realFunction ? realFunction() : -1;
+    return fn ? fn() : -1;
+}
+
+extern "C" void WINAPI Proxy_D3DPERF_SetMarker(D3DCOLOR color, LPCWSTR name)
+{
+    HMODULE systemD3D9 = GetSystemD3D9();
+    if (!systemD3D9)
+        return;
+
+    auto fn = reinterpret_cast<PerfSetMarkerFn>(
+        GetProcAddress(systemD3D9, "D3DPERF_SetMarker"));
+
+    if (fn) fn(color, name);
+}
+
+extern "C" void WINAPI Proxy_D3DPERF_SetRegion(D3DCOLOR color, LPCWSTR name)
+{
+    HMODULE systemD3D9 = GetSystemD3D9();
+    if (!systemD3D9)
+        return;
+
+    auto fn = reinterpret_cast<PerfSetRegionFn>(
+        GetProcAddress(systemD3D9, "D3DPERF_SetRegion"));
+
+    if (fn) fn(color, name);
+}
+
+extern "C" BOOL WINAPI Proxy_D3DPERF_QueryRepeatFrame()
+{
+    HMODULE systemD3D9 = GetSystemD3D9();
+    if (!systemD3D9)
+        return FALSE;
+
+    auto fn = reinterpret_cast<PerfQueryRepeatFrameFn>(
+        GetProcAddress(systemD3D9, "D3DPERF_QueryRepeatFrame"));
+
+    return fn ? fn() : FALSE;
+}
+
+extern "C" void WINAPI Proxy_D3DPERF_SetOptions(DWORD options)
+{
+    HMODULE systemD3D9 = GetSystemD3D9();
+    if (!systemD3D9)
+        return;
+
+    auto fn = reinterpret_cast<PerfSetOptionsFn>(
+        GetProcAddress(systemD3D9, "D3DPERF_SetOptions"));
+
+    if (fn) fn(options);
+}
+
+extern "C" DWORD WINAPI Proxy_D3DPERF_GetStatus()
+{
+    HMODULE systemD3D9 = GetSystemD3D9();
+    if (!systemD3D9)
+        return 0;
+
+    auto fn = reinterpret_cast<PerfGetStatusFn>(
+        GetProcAddress(systemD3D9, "D3DPERF_GetStatus"));
+
+    return fn ? fn() : 0;
 }
