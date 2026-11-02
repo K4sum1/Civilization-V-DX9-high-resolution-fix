@@ -3,11 +3,11 @@
 #include <d3d9.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
-#include <limits>
 #include <mutex>
+#include <unordered_map>
 
 using Create9Fn = IDirect3D9* (WINAPI*)(UINT);
 using Create9ExFn = HRESULT (WINAPI*)(UINT, IDirect3D9Ex**);
@@ -35,29 +35,34 @@ using PerfQueryRepeatFrameFn = BOOL (WINAPI*)();
 // IDirect3DDevice9 vtable slots
 constexpr int VTABLE_SLOT_RESET = 16;
 constexpr int VTABLE_SLOT_CREATE_DEPTH = 29;
-// IDirect3D9 vtable slots
+
+// IDirect3D9::CreateDevice is also inherited by IDirect3D9Ex.
 constexpr int VTABLE_SLOT_CREATE_DEVICE = 16;
 
-// Backbuffer dimension tracking with proper synchronization
 struct BackBufferDim {
-    UINT width;
-    UINT height;
+    UINT width = 0;
+    UINT height = 0;
 };
 
 static HMODULE gSystemD3D9 = nullptr;
 static std::once_flag gLoadOnce;
 
-static std::atomic<BackBufferDim> gBackBuffer{ {0, 0} };
+static BackBufferDim gBackBuffer{};
 static std::mutex gBackBufferMutex;
 
-static CreateDeviceFn gRealCreateDevice = nullptr;
-static ResetFn gRealReset = nullptr;
-static CreateDepthFn gRealCreateDepth = nullptr;
+// In-place vtable patching is retained, but originals are associated with
+// each vtable instead of being stored in one process-wide function pointer.
+using OriginalFunctions = std::unordered_map<void**, void*>;
+
+static OriginalFunctions gCreateDeviceOriginals;
+static OriginalFunctions gResetOriginals;
+static OriginalFunctions gCreateDepthOriginals;
+static std::mutex gVtableMutex;
 
 static void Log(const char* fmt, ...)
 {
     FILE* f = nullptr;
-    if (fopen_s(&f, "d3d9proxy.log", "a") != 0)
+    if (fopen_s(&f, "d3d9proxy.log", "a") != 0 || !f)
         return;
 
     va_list args;
@@ -77,7 +82,11 @@ static void LoadSystemD3D9()
         return;
     }
 
-    wcscat_s(path, L"\\d3d9.dll");
+    if (wcscat_s(path, L"\\d3d9.dll") != 0) {
+        Log("ERROR: Failed to construct system d3d9.dll path\n");
+        return;
+    }
+
     gSystemD3D9 = LoadLibraryW(path);
 
     if (!gSystemD3D9) {
@@ -93,110 +102,156 @@ static HMODULE GetSystemD3D9()
     return gSystemD3D9;
 }
 
-static bool PatchSlot(void* object, int index, void* replacement, void** original)
+static void** GetVtable(void* object)
 {
     if (!object)
-        return false;
+        return nullptr;
 
-    void** vtable = *reinterpret_cast<void***>(object);
+    return *reinterpret_cast<void***>(object);
+}
+
+static bool PatchSlot(
+    void* object,
+    int index,
+    void* replacement,
+    OriginalFunctions& originals)
+{
+    void** vtable = GetVtable(object);
     if (!vtable)
         return false;
 
+    std::lock_guard<std::mutex> lock(gVtableMutex);
+
+    if (vtable[index] == replacement) {
+        // It should already have been recorded when this vtable was patched.
+        return originals.find(vtable) != originals.end();
+    }
+
     DWORD oldProtect = 0;
-    if (!VirtualProtect(&vtable[index], sizeof(void*),
-                        PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    if (!VirtualProtect(
+            &vtable[index], sizeof(void*),
+            PAGE_EXECUTE_READWRITE, &oldProtect)) {
         Log("ERROR: VirtualProtect failed for vtable slot %d\n", index);
         return false;
     }
 
-    if (vtable[index] != replacement) {
-        if (original && !*original)
-            *original = vtable[index];
-
-        vtable[index] = replacement;
+    try {
+        originals.emplace(vtable, vtable[index]);
+    } catch (...) {
+        DWORD ignored = 0;
+        VirtualProtect(&vtable[index], sizeof(void*), oldProtect, &ignored);
+        Log("ERROR: Could not save original function for vtable slot %d\n", index);
+        return false;
     }
 
+    vtable[index] = replacement;
+
     DWORD ignored = 0;
-    VirtualProtect(&vtable[index], sizeof(void*), oldProtect, &ignored);
+    if (!VirtualProtect(&vtable[index], sizeof(void*), oldProtect, &ignored))
+        Log("WARNING: Could not restore vtable page protection for slot %d\n", index);
+
     return true;
 }
 
-static void RememberBackBufferSize(UINT w, UINT h)
+static void* GetOriginal(void* object, OriginalFunctions& originals)
 {
-    if (w == 0 || h == 0)
-        return; // Ignore zero dimensions
+    void** vtable = GetVtable(object);
+    if (!vtable)
+        return nullptr;
 
-    std::lock_guard<std::mutex> lock(gBackBufferMutex);
-    gBackBuffer.store({ w, h }, std::memory_order_release);
-    Log("Backbuffer dimensions updated: %ux%u\n", w, h);
+    std::lock_guard<std::mutex> lock(gVtableMutex);
+
+    const auto it = originals.find(vtable);
+    return it == originals.end() ? nullptr : it->second;
+}
+
+static void RememberBackBufferSize(UINT width, UINT height)
+{
+    if (width == 0 || height == 0)
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(gBackBufferMutex);
+        gBackBuffer = { width, height };
+    }
+
+    Log("Backbuffer dimensions updated: %ux%u\n", width, height);
 }
 
 static BackBufferDim GetBackBufferSize()
 {
     std::lock_guard<std::mutex> lock(gBackBufferMutex);
-    return gBackBuffer.load(std::memory_order_acquire);
+    return gBackBuffer;
 }
 
-static void RememberBackBuffer(IDirect3DDevice9* device)
+static bool RememberBackBuffer(IDirect3DDevice9* device)
 {
-    if (!device) {
-        RememberBackBufferSize(0, 0);
-        return;
-    }
+    if (!device)
+        return false;
 
     IDirect3DSurface9* surface = nullptr;
+    const HRESULT hr = device->GetBackBuffer(
+        0, 0, D3DBACKBUFFER_TYPE_MONO, &surface);
 
-    if (SUCCEEDED(device->GetBackBuffer(
-            0, 0, D3DBACKBUFFER_TYPE_MONO, &surface)) && surface)
-    {
-        D3DSURFACE_DESC desc{};
-        if (SUCCEEDED(surface->GetDesc(&desc))) {
-            RememberBackBufferSize(desc.Width, desc.Height);
-        } else {
-            Log("ERROR: Failed to get backbuffer surface descriptor\n");
-        }
-
-        surface->Release();
-    } else {
+    if (FAILED(hr) || !surface) {
         Log("ERROR: Failed to get backbuffer surface\n");
+        return false;
     }
+
+    D3DSURFACE_DESC desc{};
+    const HRESULT descHr = surface->GetDesc(&desc);
+    surface->Release();
+
+    if (FAILED(descHr)) {
+        Log("ERROR: Failed to get backbuffer surface descriptor\n");
+        return false;
+    }
+
+    RememberBackBufferSize(desc.Width, desc.Height);
+    return true;
 }
 
-static UINT RoundUp2048(UINT value)
+static bool RoundUp2048(UINT value, UINT* result)
 {
-    constexpr UINT64 bucket = 2048;
-    const UINT64 rounded =
-        ((static_cast<UINT64>(value) + bucket - 1) / bucket) * bucket;
+    if (!result)
+        return false;
 
-    if (rounded > (std::numeric_limits<UINT>::max)()) {
-        Log("WARNING: RoundUp2048 overflow for value %u, returning original\n", value);
-        return value;
+    constexpr std::uint64_t bucket = 2048;
+    const std::uint64_t rounded =
+        ((static_cast<std::uint64_t>(value) + bucket - 1) / bucket) * bucket;
+
+    if (rounded > static_cast<std::uint64_t>(MAXUINT)) {
+        Log("WARNING: RoundUp2048 overflow for value %u\n", value);
+        return false;
     }
 
-    return static_cast<UINT>(rounded);
+    *result = static_cast<UINT>(rounded);
+    return true;
 }
 
 static HRESULT WINAPI HookReset(
-    IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* pp)
+    IDirect3DDevice9* device,
+    D3DPRESENT_PARAMETERS* pp)
 {
-    if (pp) {
-        RememberBackBufferSize(pp->BackBufferWidth, pp->BackBufferHeight);
-    } else {
-        // Fallback: query dimensions from device if pp is null
-        RememberBackBuffer(device);
-    }
+    auto realReset = reinterpret_cast<ResetFn>(
+        GetOriginal(device, gResetOriginals));
 
-    if (!gRealReset) {
-        Log("ERROR: gRealReset not initialized in HookReset\n");
+    if (!realReset) {
+        Log("ERROR: Original Reset function not found\n");
         return D3DERR_INVALIDCALL;
     }
 
-    HRESULT hr = gRealReset(device, pp);
+    // Do not change the cache before the real reset succeeds.
+    const HRESULT hr = realReset(device, pp);
 
     if (SUCCEEDED(hr)) {
-        RememberBackBuffer(device);
+        if (!RememberBackBuffer(device) && pp) {
+            // Fallback if querying the backbuffer failed.
+            RememberBackBufferSize(pp->BackBufferWidth, pp->BackBufferHeight);
+        }
     } else {
-        Log("WARNING: Reset failed with HRESULT 0x%08X\n", static_cast<UINT>(hr));
+        Log("WARNING: Reset failed with HRESULT 0x%08X\n",
+            static_cast<UINT>(hr));
     }
 
     return hr;
@@ -204,116 +259,153 @@ static HRESULT WINAPI HookReset(
 
 static HRESULT WINAPI HookCreateDepth(
     IDirect3DDevice9* device,
-    UINT width, UINT height, D3DFORMAT format,
-    D3DMULTISAMPLE_TYPE multisample, DWORD quality, BOOL discard,
-    IDirect3DSurface9** surface, HANDLE* sharedHandle)
+    UINT width,
+    UINT height,
+    D3DFORMAT format,
+    D3DMULTISAMPLE_TYPE multisample,
+    DWORD quality,
+    BOOL discard,
+    IDirect3DSurface9** surface,
+    HANDLE* sharedHandle)
 {
-    if (!gRealCreateDepth) {
-        Log("ERROR: gRealCreateDepth not initialized in HookCreateDepth\n");
+    auto realCreateDepth = reinterpret_cast<CreateDepthFn>(
+        GetOriginal(device, gCreateDepthOriginals));
+
+    if (!realCreateDepth) {
+        Log("ERROR: Original CreateDepthStencilSurface function not found\n");
         return D3DERR_INVALIDCALL;
     }
 
     if (width == 2048 && height == 2048) {
-        BackBufferDim bbDim = GetBackBufferSize();
-        
-        const UINT requiredWidth = (std::max)(width, bbDim.width);
-        const UINT requiredHeight = (std::max)(height, bbDim.height);
+        const BackBufferDim bb = GetBackBufferSize();
 
-        const UINT roundedWidth = RoundUp2048(requiredWidth);
-        const UINT roundedHeight = RoundUp2048(requiredHeight);
+        const UINT requiredWidth = (std::max)(width, bb.width);
+        const UINT requiredHeight = (std::max)(height, bb.height);
 
-        // Validate rounding result
-        if (roundedWidth < requiredWidth || roundedHeight < requiredHeight) {
-            Log("ERROR: RoundUp2048 produced invalid result: "
-                "required %ux%u -> rounded %ux%u\n",
-                requiredWidth, requiredHeight, roundedWidth, roundedHeight);
-        } else if (roundedWidth > width || roundedHeight > height) {
-            Log("Scaling depth surface %ux%u -> %ux%u (backbuffer: %ux%u)\n",
-                width, height, roundedWidth, roundedHeight, bbDim.width, bbDim.height);
+        if (requiredWidth > width || requiredHeight > height) {
+            Log("Depth surface needs enlargement: original %ux%u, "
+                "required %ux%u (backbuffer %ux%u)\n",
+                width, height, requiredWidth, requiredHeight,
+                bb.width, bb.height);
 
-            HRESULT hr = gRealCreateDepth(
-                device, roundedWidth, roundedHeight, format,
+            // Try the exact required dimensions first to avoid unnecessary
+            // memory use from rounding both axes up to a 2048-pixel bucket.
+            if (surface)
+                *surface = nullptr;
+
+            HRESULT hr = realCreateDepth(
+                device, requiredWidth, requiredHeight, format,
                 multisample, quality, discard, surface, sharedHandle);
 
             if (SUCCEEDED(hr)) {
-                Log("Successfully allocated rounded depth surface %ux%u\n",
-                    roundedWidth, roundedHeight);
+                Log("Allocated exact depth surface %ux%u\n",
+                    requiredWidth, requiredHeight);
                 return hr;
             }
 
-            Log("Rounded allocation failed: 0x%08X\n", static_cast<UINT>(hr));
+            Log("Exact depth allocation failed: 0x%08X\n",
+                static_cast<UINT>(hr));
 
-            if (requiredWidth != roundedWidth || requiredHeight != roundedHeight) {
-                Log("Attempting exact allocation: %ux%u\n", requiredWidth, requiredHeight);
-                hr = gRealCreateDepth(
-                    device, requiredWidth, requiredHeight, format,
+            UINT roundedWidth = 0;
+            UINT roundedHeight = 0;
+
+            const bool widthRounded =
+                RoundUp2048(requiredWidth, &roundedWidth);
+            const bool heightRounded =
+                RoundUp2048(requiredHeight, &roundedHeight);
+
+            if (widthRounded && heightRounded &&
+                (roundedWidth != requiredWidth ||
+                 roundedHeight != requiredHeight)) {
+                if (surface)
+                    *surface = nullptr;
+
+                hr = realCreateDepth(
+                    device, roundedWidth, roundedHeight, format,
                     multisample, quality, discard, surface, sharedHandle);
 
                 if (SUCCEEDED(hr)) {
-                    Log("Successfully allocated exact depth surface %ux%u\n",
-                        requiredWidth, requiredHeight);
+                    Log("Allocated rounded depth surface %ux%u\n",
+                        roundedWidth, roundedHeight);
                     return hr;
                 }
 
-                Log("Exact allocation failed: 0x%08X\n", static_cast<UINT>(hr));
+                Log("Rounded depth allocation failed: 0x%08X\n",
+                    static_cast<UINT>(hr));
             }
 
             Log("Falling back to original depth size %ux%u\n", width, height);
         }
     }
 
-    return gRealCreateDepth(
+    if (surface)
+        *surface = nullptr;
+
+    return realCreateDepth(
         device, width, height, format,
         multisample, quality, discard, surface, sharedHandle);
 }
 
-static HRESULT WINAPI HookCreateDevice(
-    IDirect3D9* d3d, UINT adapter, D3DDEVTYPE type, HWND focusWindow,
-    DWORD behavior, D3DPRESENT_PARAMETERS* pp,
-    IDirect3DDevice9** device)
+static void InstallDeviceHooks(IDirect3DDevice9* device)
 {
-    if (pp) {
-        RememberBackBufferSize(pp->BackBufferWidth, pp->BackBufferHeight);
+    if (!PatchSlot(
+            device, VTABLE_SLOT_RESET,
+            reinterpret_cast<void*>(HookReset),
+            gResetOriginals)) {
+        Log("ERROR: Failed to patch Reset vtable slot\n");
     }
 
-    if (!gRealCreateDevice) {
-        Log("ERROR: gRealCreateDevice not initialized in HookCreateDevice\n");
+    if (!PatchSlot(
+            device, VTABLE_SLOT_CREATE_DEPTH,
+            reinterpret_cast<void*>(HookCreateDepth),
+            gCreateDepthOriginals)) {
+        Log("ERROR: Failed to patch CreateDepthStencilSurface vtable slot\n");
+    }
+}
+
+static HRESULT WINAPI HookCreateDevice(
+    IDirect3D9* d3d,
+    UINT adapter,
+    D3DDEVTYPE type,
+    HWND focusWindow,
+    DWORD behavior,
+    D3DPRESENT_PARAMETERS* pp,
+    IDirect3DDevice9** device)
+{
+    auto realCreateDevice = reinterpret_cast<CreateDeviceFn>(
+        GetOriginal(d3d, gCreateDeviceOriginals));
+
+    if (!realCreateDevice) {
+        Log("ERROR: Original CreateDevice function not found\n");
         return D3DERR_INVALIDCALL;
     }
 
-    HRESULT hr = gRealCreateDevice(
+    const HRESULT hr = realCreateDevice(
         d3d, adapter, type, focusWindow, behavior, pp, device);
 
     if (SUCCEEDED(hr) && device && *device) {
-        RememberBackBuffer(*device);
-
-        // In-place vtable patch, simpler and less crash-prone than cloning.
-        // IDirect3DDevice9 vtable slots:
-        // Reset = 16
-        // CreateDepthStencilSurface = 29
-        
-        if (!PatchSlot(*device, VTABLE_SLOT_RESET, 
-                       reinterpret_cast<void*>(HookReset),
-                       reinterpret_cast<void**>(&gRealReset))) {
-            Log("ERROR: Failed to patch Reset vtable slot\n");
-            return D3DERR_INVALIDCALL;
-        }
-        
-        if (!PatchSlot(*device, VTABLE_SLOT_CREATE_DEPTH, 
-                       reinterpret_cast<void*>(HookCreateDepth),
-                       reinterpret_cast<void**>(&gRealCreateDepth))) {
-            Log("ERROR: Failed to patch CreateDepthStencilSurface vtable slot\n");
-            return D3DERR_INVALIDCALL;
+        if (!RememberBackBuffer(*device) && pp) {
+            RememberBackBufferSize(pp->BackBufferWidth, pp->BackBufferHeight);
         }
 
-        Log("Device hooks installed successfully\n");
-    } else {
-        if (!SUCCEEDED(hr)) {
-            Log("WARNING: CreateDevice failed with HRESULT 0x%08X\n", static_cast<UINT>(hr));
-        }
+        InstallDeviceHooks(*device);
+        Log("Device hooks installed or attempted\n");
+    } else if (FAILED(hr)) {
+        Log("WARNING: CreateDevice failed with HRESULT 0x%08X\n",
+            static_cast<UINT>(hr));
     }
 
+    // If hook installation fails, preserve the real CreateDevice result.
     return hr;
+}
+
+static bool InstallCreateDeviceHook(IDirect3D9* d3d)
+{
+    return PatchSlot(
+        d3d,
+        VTABLE_SLOT_CREATE_DEVICE,
+        reinterpret_cast<void*>(HookCreateDevice),
+        gCreateDeviceOriginals);
 }
 
 extern "C" IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT sdkVersion)
@@ -340,10 +432,7 @@ extern "C" IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT sdkVersion)
         return nullptr;
     }
 
-    // IDirect3D9::CreateDevice = slot 16
-    if (!PatchSlot(d3d, VTABLE_SLOT_CREATE_DEVICE, 
-                   reinterpret_cast<void*>(HookCreateDevice),
-                   reinterpret_cast<void**>(&gRealCreateDevice))) {
+    if (!InstallCreateDeviceHook(d3d)) {
         Log("ERROR: Failed to patch CreateDevice vtable slot\n");
         d3d->Release();
         return nullptr;
@@ -379,10 +468,20 @@ extern "C" HRESULT WINAPI Proxy_Direct3DCreate9Ex(
         return D3DERR_NOTAVAILABLE;
     }
 
-    HRESULT hr = realCreate9Ex(sdkVersion, out);
-    if (SUCCEEDED(hr)) {
-        Log("Direct3DCreate9Ex succeeded\n");
-    } else {
+    const HRESULT hr = realCreate9Ex(sdkVersion, out);
+
+    if (SUCCEEDED(hr) && *out) {
+        // IDirect3D9Ex inherits IDirect3D9, including CreateDevice.
+        IDirect3D9* base = static_cast<IDirect3D9*>(*out);
+
+        if (!InstallCreateDeviceHook(base)) {
+            // Leave the successfully created Ex interface usable, but log that
+            // the depth-surface fix will not be active on this path.
+            Log("ERROR: Failed to patch IDirect3D9Ex CreateDevice slot\n");
+        } else {
+            Log("IDirect3D9Ex CreateDevice slot patched\n");
+        }
+    } else if (FAILED(hr)) {
         Log("ERROR: Direct3DCreate9Ex failed with HRESULT 0x%08X\n", static_cast<UINT>(hr));
     }
 
