@@ -3,7 +3,6 @@
 #include <d3d9.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <limits>
@@ -47,7 +46,7 @@ struct BackBufferDim {
 static HMODULE gSystemD3D9 = nullptr;
 static std::once_flag gLoadOnce;
 
-static std::atomic<BackBufferDim> gBackBuffer{ {0, 0} };
+static BackBufferDim gBackBuffer{ 0, 0 };
 static std::mutex gBackBufferMutex;
 
 static CreateDeviceFn gRealCreateDevice = nullptr;
@@ -127,14 +126,14 @@ static void RememberBackBufferSize(UINT w, UINT h)
         return; // Ignore zero dimensions
 
     std::lock_guard<std::mutex> lock(gBackBufferMutex);
-    gBackBuffer.store({ w, h }, std::memory_order_release);
+    gBackBuffer = { w, h };
     Log("Backbuffer dimensions updated: %ux%u\n", w, h);
 }
 
 static BackBufferDim GetBackBufferSize()
 {
     std::lock_guard<std::mutex> lock(gBackBufferMutex);
-    return gBackBuffer.load(std::memory_order_acquire);
+    return gBackBuffer;
 }
 
 static void RememberBackBuffer(IDirect3DDevice9* device)
