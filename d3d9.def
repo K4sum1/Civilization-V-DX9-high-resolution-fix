@@ -1,5 +1,11 @@
 LIBRARY d3d9
 EXPORTS
     Direct3DCreate9=_Proxy_Direct3DCreate9@4
+    Direct3DCreate9Ex=_Proxy_Direct3DCreate9Ex@8
     D3DPERF_BeginEvent=_Proxy_D3DPERF_BeginEvent@8
     D3DPERF_EndEvent=_Proxy_D3DPERF_EndEvent@0
+    D3DPERF_SetMarker=_Proxy_D3DPERF_SetMarker@8
+    D3DPERF_SetRegion=_Proxy_D3DPERF_SetRegion@8
+    D3DPERF_QueryRepeatFrame=_Proxy_D3DPERF_QueryRepeatFrame@0
+    D3DPERF_SetOptions=_Proxy_D3DPERF_SetOptions@4
+    D3DPERF_GetStatus=_Proxy_D3DPERF_GetStatus@0
